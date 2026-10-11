@@ -1,0 +1,109 @@
+name: Build and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: torch-server-list-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Test enrollment, publication and Nexus sector counts
+        run: |
+          dotnet run --project Tests/Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher tests failed.' }
+          ./Tests/PublishChecks.ps1
+      - name: Dependency cache key
+        id: cache-key
+        shell: pwsh
+        run: '"week=$((Get-Date).ToString("yyyy"))-$([System.Globalization.ISOWeek]::GetWeekOfYear((Get-Date)))" >> $env:GITHUB_OUTPUT'
+      - uses: actions/cache@v4
+        id: dependencies
+        with:
+          path: .dev/dependencies
+          key: torch-se-${{ runner.os }}-${{ steps.cache-key.outputs.week }}
+      - name: Download Torch and dedicated server references
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force .dev/dependencies/torch, .dev/steamcmd | Out-Null
+          Invoke-WebRequest 'https://build.torchapi.com/job/Torch/job/master/lastSuccessfulBuild/artifact/bin/torch-server.zip' -OutFile .dev/torch.zip
+          Expand-Archive .dev/torch.zip .dev/dependencies/torch -Force
+          Invoke-WebRequest 'https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip' -OutFile .dev/steamcmd.zip
+          Expand-Archive .dev/steamcmd.zip .dev/steamcmd -Force
+          $game = Join-Path $PWD '.dev/game'
+          & .dev/steamcmd/steamcmd.exe +force_install_dir $game +login anonymous +app_update 298740 validate +quit
+          if (!(Test-Path "$game/DedicatedServer64/Sandbox.Game.dll")) { throw 'Steam did not produce dedicated server assemblies.' }
+          New-Item -ItemType Directory -Force .dev/dependencies/game | Out-Null
+          Copy-Item "$game/DedicatedServer64/*.dll" .dev/dependencies/game
+          if (!(Test-Path .dev/dependencies/torch/Torch.API.dll)) { throw 'Torch download lacks Torch.API.dll.' }
+      - name: Build and package
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [xml]$manifest = Get-Content manifest.xml
+          $version = $manifest.PluginManifest.Version
+          if ($env:RELEASE_TAG) {
+            if ($env:RELEASE_TAG -notmatch '^v(\d+\.\d+\.\d+)$') { throw 'Release tags must be vMAJOR.MINOR.PATCH.' }
+            $version = $Matches[1]
+            $manifest.PluginManifest.Version = $version
+            $manifest.Save((Join-Path $PWD 'manifest.xml'))
+          }
+          dotnet build Plugin/ServerList.Torch.csproj -c Release "-p:Torch=$PWD/.dev/dependencies/torch" "-p:Game=$PWD/.dev/dependencies/game" "-p:Version=$version"
+          if ($LASTEXITCODE -ne 0) { throw 'Plugin build failed.' }
+          New-Item -ItemType Directory -Force .dev/package, artifacts | Out-Null
+          Copy-Item Plugin/bin/Release/net48/CometWorks.ServerList.Torch.dll, Plugin/bin/Release/net48/BouncyCastle.Cryptography.dll, manifest.xml, LICENSE, THIRD-PARTY-NOTICES.md, BouncyCastle.LICENSE.txt .dev/package
+          Compress-Archive .dev/package/* artifacts/CometWorks.ServerList.Torch.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CometWorks.ServerList.Torch
+          path: artifacts/*.zip
+          if-no-files-found: error
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: torchapi-server-list-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: CometWorks.ServerList.Torch
+          path: artifacts
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" artifacts/CometWorks.ServerList.Torch.zip --clobber
+          else
+            gh release create "$RELEASE_TAG" artifacts/CometWorks.ServerList.Torch.zip --generate-notes
+          fi
+      - name: Publish to Torch as OwendB
+        env:
+          TORCH_API_KEY: ${{ secrets.TORCH_API_KEY }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          [xml]$manifest = Get-Content manifest.xml
+          $manifest.PluginManifest.Version = $env:RELEASE_TAG.Substring(1)
+          $manifest.Save((Join-Path $PWD 'manifest.xml'))
+          ./ci/Publish-Torch.ps1 -ZipPath artifacts/CometWorks.ServerList.Torch.zip

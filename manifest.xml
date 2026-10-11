@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PluginManifest>
+  <Name>CometWorks Server List</Name>
+  <Author>owendb</Author>
+  <Version>0.1.0</Version>
+  <Description>Publish Torch and Nexus communities on se-servers.net.</Description>
+  <Guid>e9adbc4e-5b8c-4bca-a52d-d5cff2a4a9b0</Guid>
+</PluginManifest>
