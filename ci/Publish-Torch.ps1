@@ -38,8 +38,21 @@ if ($action -eq 'upload') {
 } else {
     $form.updateNote = "Release $version — https://github.com/CometWorks/server-list-torch-plugin/releases/tag/v$version"
 }
-$result = Invoke-RestMethod 'https://torchapi.com/api/plugins/upload' -Method Post -Form $form -TimeoutSec 120
+$multipart = [System.Net.Http.MultipartFormDataContent]::new()
+try {
+    foreach ($field in $form.Keys) {
+        if ($field -eq 'uploadZip') {
+            $part = [System.Net.Http.StreamContent]::new($form.uploadZip.OpenRead())
+            $part.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::new('application/zip')
+            $multipart.Add($part, $field, $form.uploadZip.Name)
+        } else {
+            $multipart.Add([System.Net.Http.StringContent]::new([string]$form[$field]), $field)
+        }
+    }
+    $result = Invoke-RestMethod 'https://torchapi.com/api/plugins/upload' -Method Post -Body $multipart -TimeoutSec 120
+} finally { $multipart.Dispose() }
 if ($result -is [string]) { $result = $result | ConvertFrom-Json }
-if ($result.error_message -or !$result.success_message) { throw 'Torch rejected the plugin upload. Check account ownership, manifest and version.' }
+if ($result.error_message) { throw ('Torch rejected the plugin upload: ' + ([string]$result.error_message).Replace($env:TORCH_API_KEY, '[redacted]')) }
+if (!$result.success_message) { throw 'Torch returned no upload confirmation.' }
 Write-Host "Published $($manifest.PluginManifest.Name) $version under OwendB."
 Write-Host "https://torchapi.com/plugins/view/$guid"

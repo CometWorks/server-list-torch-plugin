@@ -8,9 +8,15 @@ try {
     $global:ExpectedAction = 'upload'
     $global:Uploads = 0
     function Invoke-RestMethod {
-        param($Uri, $Method, $Form, $TimeoutSec)
+        param($Uri, $Method, $Body, $TimeoutSec)
         if (!$Method) { return $global:ExistingRegistration }
-        if ($Uri -ne 'https://torchapi.com/api/plugins/upload' -or $Method -ne 'Post' -or $Form.username -ne 'OwendB' -or $Form.secret -ne $env:TORCH_API_KEY -or $Form.action -ne $global:ExpectedAction -or $Form.uploadZip -isnot [System.IO.FileInfo]) {
+        $Form = @{}
+        foreach ($part in $Body) {
+            $name = $part.Headers.ContentDisposition.Name.Trim('"')
+            $Form[$name] = $part.ReadAsStringAsync().GetAwaiter().GetResult()
+            if ($name -eq 'uploadZip' -and ($part.Headers.ContentType.MediaType -ne 'application/zip' -or !$part.Headers.ContentDisposition.FileName)) { throw 'ZIP MIME type or filename missing.' }
+        }
+        if ($Uri -ne 'https://torchapi.com/api/plugins/upload' -or $Method -ne 'Post' -or $Form.username -ne 'OwendB' -or $Form.secret -ne $env:TORCH_API_KEY -or $Form.action -ne $global:ExpectedAction -or !$Form.uploadZip) {
             throw 'Unexpected upload contract.'
         }
         if ($Form.action -eq 'upload' -and (!$Form.name -or !$Form.description -or $Form.isPrivate -ne 'false')) { throw 'Missing first-upload metadata.' }

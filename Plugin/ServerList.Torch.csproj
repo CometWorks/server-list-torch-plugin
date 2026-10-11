@@ -4,7 +4,7 @@
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <AssemblyName>CometWorks.ServerList.Torch</AssemblyName>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Game Condition="'$(Game)' == ''">$(Torch)/DedicatedServer64</Game>
   </PropertyGroup>
   <ItemGroup>
