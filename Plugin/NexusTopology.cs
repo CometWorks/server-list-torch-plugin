@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Linq;
 using ProtoBuf;
 
@@ -24,7 +25,7 @@ public sealed class NexusTopology
 [ProtoContract]
 public sealed class NexusServer
 {
-    [ProtoMember(2)] public byte Id { get; set; }
+    [ProtoMember(2), DefaultValue((byte)1)] public byte Id { get; set; } = 1;
     [ProtoMember(3)] public byte ClusterId { get; set; }
 }
 [ProtoContract]

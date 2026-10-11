@@ -6,6 +6,10 @@ using Newtonsoft.Json;
 using ProtoBuf;
 
 static void Check(bool condition, string message) { if (!condition) throw new Exception(message); Console.WriteLine("PASS " + message); }
+// Nexus omits ServerID when it equals its declared protobuf default of 1.
+using (var defaults = new MemoryStream(new byte[] { 0xa2, 1, 2, 0x18, 1, 0xf2, 1, 4, 0x18, 1, 0x68, 1, 0x90, 3, 1 }))
+    Check(NexusTopology.Count(Serializer.Deserialize<NexusTopology>(defaults), id => id == 1) == new Cluster("Nexus", 1, 1),
+        "decodes Nexus wire default when server ID is omitted");
 var topology = new NexusTopology { CurrentCluster = 1, Servers = [new() { Id = 1, ClusterId = 1 },
     new() { Id = 2, ClusterId = 1 }, new() { Id = 3, ClusterId = 2 }],
     Sectors = [new() { Id = 1, ServerId = 1 }, new() { Id = 2, ServerId = 1 }, new() { Id = 3, ServerId = 2 },
