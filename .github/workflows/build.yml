@@ -43,7 +43,12 @@ jobs:
           Invoke-WebRequest 'https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip' -OutFile .dev/steamcmd.zip
           Expand-Archive .dev/steamcmd.zip .dev/steamcmd -Force
           $game = Join-Path $PWD '.dev/game'
-          & .dev/steamcmd/steamcmd.exe +force_install_dir $game +login anonymous +app_update 298740 validate +quit
+          & .dev/steamcmd/steamcmd.exe +quit
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            & .dev/steamcmd/steamcmd.exe +@sSteamCmdForcePlatformType windows +force_install_dir $game +login anonymous +app_info_update 1 +app_update 298740 validate +quit
+            if (Test-Path "$game/DedicatedServer64/Sandbox.Game.dll") { break }
+            if ($attempt -lt 3) { Start-Sleep -Seconds 10 }
+          }
           if (!(Test-Path "$game/DedicatedServer64/Sandbox.Game.dll")) { throw 'Steam did not produce dedicated server assemblies.' }
           New-Item -ItemType Directory -Force .dev/dependencies/game | Out-Null
           Copy-Item "$game/DedicatedServer64/*.dll" .dev/dependencies/game
