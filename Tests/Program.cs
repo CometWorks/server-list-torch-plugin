@@ -29,69 +29,102 @@ var root = Path.Combine(Path.GetTempPath(), "torch-list-" + Guid.NewGuid().ToStr
 Directory.CreateDirectory(root);
 try
 {
-    var handler = new Backoffice();
-    using var http = new HttpClient(handler) { BaseAddress = new Uri("https://backoffice.example/") };
-    string identity, listingId;
-    var listing = new Listing("", "Fixture community", "play.example.org", 27016, DateTimeOffset.UtcNow,
-        true, null, null, null, Cluster: new("Nexus", 2, 3));
+    var handler = new DirectoryReceiver();
+    using var http = new HttpClient(handler) { BaseAddress = new Uri("https://directory.example/") };
+    var admins = new[] { new Admin("Steam", "76561198000000001") };
+    var standalone = new Listing("", "Fixture community", "play.example.org", 27016, DateTimeOffset.UtcNow,
+        true, 3, 16, 1);
+    var nexus = standalone with { PlayersOnline = null, MaxPlayers = null, SimSpeed = null, Cluster = new("Nexus", 2, 3) };
+    string installationId, listingId;
     using (var publisher = new Publisher(root, http))
     {
-        identity = publisher.InstallationId; listingId = publisher.ListingId;
-        await publisher.SendAsync(listing, [new("Steam", "76561198000000001")], default);
-        Check(handler.Epoch == 1 && handler.Sequence == 1, "enrollment signature and OAEP decryption interoperate with .NET RSA");
-        Check(handler.Publication?.Listings.Single().Cluster == listing.Cluster && handler.Publication!.Listings[0].ListingId == listingId,
-            "publication carries Torch/Nexus telemetry with stable listing identity");
-        await publisher.SendAsync(null, [], default);
-        Check(handler.Sequence == 2 && handler.Withdrawn, "withdrawal advances source ordering");
+        installationId = publisher.InstallationId;
+        listingId = publisher.ListingId;
+        Check(await publisher.SendAsync(standalone, admins, default) == HttpStatusCode.NoContent,
+            "fresh installation publishes directly with a key-derived identity and .NET-verifiable RSA-PSS signature");
+        var first = handler.Accepted!;
+        Check(first.Epoch == 1 && first.Sequence == 1 && first.Admins.SequenceEqual(admins)
+            && first.Listings.Single() == standalone with { ListingId = listingId },
+            "standalone publication carries Steam admins and Torch telemetry");
+        Check(await publisher.SendAsync(nexus, admins, default) == HttpStatusCode.NoContent
+            && handler.Accepted!.Sequence == 2 && handler.Accepted.Listings.Single() == nexus with { ListingId = listingId },
+            "Nexus publication carries sector counts and leaves local player metrics unknown");
+        Check(await publisher.SendAsync(null, admins, default) == HttpStatusCode.NoContent
+            && handler.Accepted!.Sequence == 3 && handler.Accepted.Admins.Length == 0 && handler.Accepted.Listings.Length == 0,
+            "withdrawal advances ordering with empty listings and admins");
         try { using var duplicate = new Publisher(root, http); Check(false, "duplicate publisher must be fenced"); }
         catch (IOException) { Check(true, "process lock prevents concurrent publishers sharing identity"); }
     }
     using (var restarted = new Publisher(root, http))
     {
-        Check(restarted.InstallationId == identity && restarted.ListingId == listingId, "restart retains machine and listing identity");
-        await restarted.SendAsync(listing, [new("Steam", "76561198000000001")], default);
-        Check(handler.Epoch == 2 && handler.Sequence == 1 && handler.Enrollments == 2, "restart reserves higher epoch and re-enrolls same key");
+        Check(restarted.InstallationId == installationId && restarted.ListingId == listingId,
+            "restart retains machine and listing identity");
+        Check(await restarted.SendAsync(standalone, admins, default) == HttpStatusCode.NoContent
+            && handler.Accepted!.Epoch == 2 && handler.Accepted.Sequence == 1 && handler.Requests == 4,
+            "restart reserves a higher epoch and sends one request per update");
     }
+
+    var legacy = Path.Combine(root, "legacy");
+    Directory.CreateDirectory(legacy);
+    var oldInstallation = Guid.NewGuid().ToString("N");
+    var oldListing = Guid.NewGuid().ToString("N");
+    using var oldKey = RSA.Create(3072);
+    File.WriteAllText(Path.Combine(legacy, "identity.json"), JsonConvert.SerializeObject(new[] { oldInstallation, oldListing }));
+    File.WriteAllText(Path.Combine(legacy, "machine-key.pem"), oldKey.ExportRSAPrivateKeyPem());
+    File.WriteAllText(Path.Combine(legacy, "epoch"), "7");
+
+    var legacyReceiver = new DirectoryReceiver();
+    using var legacyHttp = new HttpClient(legacyReceiver) { BaseAddress = http.BaseAddress };
+    using var upgraded = new Publisher(legacy, legacyHttp);
+    Check(await upgraded.SendAsync(nexus, admins, default) == HttpStatusCode.Forbidden,
+        "an unimported legacy identity surfaces the directory rejection");
+    legacyReceiver.Keys.Add(oldInstallation, DirectoryReceiver.Fingerprint(oldKey));
+    Check(await upgraded.SendAsync(nexus, admins, default) == HttpStatusCode.NoContent
+        && legacyReceiver.Accepted!.InstallationId == oldInstallation && legacyReceiver.Accepted.Epoch == 8
+        && legacyReceiver.Accepted.Sequence == 2 && legacyReceiver.Accepted.Listings.Single().ListingId == oldListing,
+        "imported legacy identity uses the original key, installation ID, listing ID and higher epoch");
 }
 finally { Directory.Delete(root, true); }
 
-sealed class Backoffice : HttpMessageHandler
+sealed class DirectoryReceiver : HttpMessageHandler
 {
-    public long Epoch, Sequence;
-    public int Enrollments;
-    public bool Withdrawn;
-    public Publication? Publication;
-    private string? installation, publicKey;
-    private const string Credential = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    public int Requests { get; private set; }
+    public Publication? Accepted { get; private set; }
+    public Dictionary<string, string> Keys { get; } = new();
+
+    public static string Fingerprint(RSA key) => Convert.ToHexStringLower(SHA256.HashData(key.ExportSubjectPublicKeyInfo()));
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
+        Requests++;
+        if (request.Method != HttpMethod.Put || request.RequestUri?.AbsolutePath != "/v2/listings"
+            || request.Headers.Authorization is not null || request.Headers.Contains("X-Installation-Id"))
+            throw new Exception("Unexpected directory request");
         var body = await request.Content!.ReadAsStringAsync(cancellationToken);
-        if (request.RequestUri!.AbsolutePath == "/v1/installations/enroll")
-        {
-            var enrollment = JsonConvert.DeserializeObject<Enrollment>(body, Wire.Json)!;
-            using var key = RSA.Create(); key.ImportSubjectPublicKeyInfo(Convert.FromBase64String(enrollment.PublicKey), out _);
-            var signed = Encoding.UTF8.GetBytes($"CometWorks.Diagnostics.Enrollment.v1\n{enrollment.InstallationId}\n{enrollment.PublicKey}\n{enrollment.IssuedAt}");
-            if (key.KeySize != 3072 || !key.VerifyData(signed, Convert.FromBase64String(enrollment.Signature), HashAlgorithmName.SHA256, RSASignaturePadding.Pss)
-                || installation is not null && (installation != enrollment.InstallationId || publicKey != enrollment.PublicKey))
-                throw new Exception("Invalid enrollment signature/key binding");
-            installation = enrollment.InstallationId; publicKey = enrollment.PublicKey; Enrollments++;
-            return new(HttpStatusCode.OK) { Content = new StringContent(JsonConvert.SerializeObject(new EnrollmentResponse(installation,
-                Convert.ToBase64String(key.Encrypt(Encoding.ASCII.GetBytes(Credential), RSAEncryptionPadding.OaepSHA256))), Wire.Json)) };
-        }
-        if (request.Headers.Authorization?.Parameter != Credential || request.Headers.GetValues("X-Installation-Id").Single() != installation)
-            throw new Exception("Missing machine credential");
-        Withdrawal order;
-        if (request.RequestUri.AbsolutePath == "/v1/torch/publication" && request.Method == HttpMethod.Put)
-        {
-            Publication = JsonConvert.DeserializeObject<Publication>(body, Wire.Json)!;
-            order = new(Publication.SchemaVersion, Publication.InstallationId, Publication.Epoch, Publication.Sequence); Withdrawn = false;
-        }
-        else if (request.RequestUri.AbsolutePath == "/v1/torch/withdraw" && request.Method == HttpMethod.Post)
-        { order = JsonConvert.DeserializeObject<Withdrawal>(body, Wire.Json)!; Withdrawn = true; }
-        else throw new Exception("Unexpected request path/method");
-        if (order.InstallationId != installation || order.Epoch < Epoch || order.Epoch == Epoch && order.Sequence <= Sequence)
-            throw new Exception("Stale or foreign source ordering");
-        Epoch = order.Epoch; Sequence = order.Sequence;
+        var options = new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web)
+        { RespectRequiredConstructorParameters = true };
+        var envelope = System.Text.Json.JsonSerializer.Deserialize<SignedPublication>(body, options)!;
+        var spki = Convert.FromBase64String(envelope.PublicKey);
+        var payload = Convert.FromBase64String(envelope.Payload);
+        using var key = RSA.Create();
+        key.ImportSubjectPublicKeyInfo(spki, out var read);
+        byte[] signed = [.. Encoding.ASCII.GetBytes("CometWorks.Directory.Publication.v2\n"), .. payload];
+        if (read != spki.Length || key.KeySize != 3072
+            || !key.VerifyData(signed, Convert.FromBase64String(envelope.Signature), HashAlgorithmName.SHA256, RSASignaturePadding.Pss))
+            throw new Exception("Invalid publication signature");
+        var publication = System.Text.Json.JsonSerializer.Deserialize<Publication>(payload, options)!;
+        var now = DateTimeOffset.UtcNow;
+        if (publication.SchemaVersion != 2 || publication.IssuedAtUtc <= now.AddSeconds(-30) || publication.IssuedAtUtc > now.AddSeconds(5)
+            || publication.Epoch <= 0 || publication.Sequence <= 0)
+            throw new Exception("Invalid publication schema, timestamp or ordering");
+        var fingerprint = Fingerprint(key);
+        if (Keys.TryGetValue(publication.InstallationId, out var pinned) ? pinned != fingerprint : publication.InstallationId != fingerprint[..32])
+            return new(HttpStatusCode.Forbidden);
+        if (Accepted is { } accepted && (publication.Epoch < accepted.Epoch
+            || publication.Epoch == accepted.Epoch && publication.Sequence <= accepted.Sequence))
+            return new(HttpStatusCode.Conflict);
+        Keys[publication.InstallationId] = fingerprint;
+        Accepted = publication;
         return new(HttpStatusCode.NoContent);
     }
 }
